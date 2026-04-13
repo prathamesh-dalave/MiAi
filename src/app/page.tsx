@@ -57,7 +57,7 @@ export default function Home() {
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Try: 'Create a PPT', 'Explain code', 'Summarize text'..."
+            placeholder="Search AI tools..."
             className="flex-1 bg-transparent text-sm md:text-base text-white placeholder-gray-500 outline-none"
           />
           <button
