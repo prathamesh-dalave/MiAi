@@ -1,0 +1,335 @@
+import { NextResponse } from "next/server";
+import { supabase } from "@/lib/supabase";
+
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const COHERE_API_KEY = process.env.COHERE_API_KEY;
+
+// Tool Provider Mapping Decoder
+type ProviderType = "Groq" | "GeminiGrounded" | "Cohere" | "HuggingFace" | "GroqWhisper" | "DeepgramTTS";
+
+interface ToolConfig {
+  provider: ProviderType;
+  model: string;
+}
+
+const TOOL_CONFIG: Record<string, ToolConfig> = {
+  // ── AI Chatbots (all search-grounded for real-time 2026 info) ──
+  "gemini": { provider: "GeminiGrounded", model: "gemini-2.5-flash" },
+  "mistral": { provider: "Cohere", model: "command-a-03-2025" },
+
+  // ── Content Writing (search-grounded for factual, current content) ──
+  "llama-write": { provider: "GeminiGrounded", model: "gemini-2.5-flash" },
+  "mixtral-write": { provider: "Cohere", model: "command-a-03-2025" },
+
+  // ── Code Generation (Groq for speed — code doesn't need live news) ──
+  "codellama": { provider: "Groq", model: "meta-llama/llama-4-scout-17b-16e-instruct" },
+  "starcoder": { provider: "Groq", model: "qwen/qwen3-32b" },
+  "qwen-coder": { provider: "Groq", model: "qwen/qwen3-32b" }, 
+
+  // ── Image Generation ──
+  "flux": { provider: "HuggingFace", model: "black-forest-labs/FLUX.1-schnell" },
+  "sdxl": { provider: "HuggingFace", model: "stabilityai/sdxl-turbo" },
+
+  // ── Audio Tools ──
+  "whisper-stt": { provider: "GroqWhisper", model: "whisper-large-v3" },
+  "deepgram-tts": { provider: "DeepgramTTS", model: "aura-2-thalia-en" },
+};
+
+export async function POST(req: Request) {
+  try {
+    const contentType = req.headers.get("content-type") || "";
+    
+    let prompt = "";
+    let toolId = "";
+    let category = "";
+    let audioFile: File | null = null;
+
+    if (contentType.includes("multipart/form-data")) {
+      const formData = await req.formData();
+      prompt = (formData.get("prompt") as string) || "Transcribe this audio";
+      toolId = formData.get("toolId") as string;
+      category = formData.get("category") as string;
+      audioFile = formData.get("audio") as File | null;
+    } else {
+      const body = await req.json();
+      prompt = body.prompt;
+      toolId = body.toolId;
+      category = body.category;
+    }
+
+    if ((!prompt && !audioFile) || !toolId || !category) {
+      return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
+    }
+
+    const config = TOOL_CONFIG[toolId];
+    if (!config) {
+      return NextResponse.json({ error: "Invalid tool configuration or deprecated tool" }, { status: 400 });
+    }
+
+    let resultText = "";
+    let isImage = false;
+    let isAudio = false;
+
+    // ── SYSTEM PROMPT INJECTION ──
+    const currentDate = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+    let systemPrompt = `You are a helpful, professional AI assistant. Today's date is ${currentDate}. Provide the most current and up-to-date information available.`;
+    if (category === "code-generation") {
+      systemPrompt = `You are an expert Senior Software Engineer with knowledge current to ${currentDate}. Provide ONLY the code formatted in standard Markdown blocks. NO conversational filler.`;
+    } else if (category === "content-writing") {
+      systemPrompt = `You are a world-class content writer. Today's date is ${currentDate}. Write engaging, factually accurate, and up-to-date content using the latest information from web search results.`;
+    }
+
+    // ═══════════════════════════════════════════
+    // HUGGING FACE (Image Generation)
+    // ═══════════════════════════════════════════
+    if (config.provider === "HuggingFace") {
+      if (!HUGGINGFACE_API_KEY) throw new Error("HUGGINGFACE_API_KEY is missing in backend.");
+      isImage = true;
+      let hfResponse: Response | null = null;
+      let retries = 4;
+      
+      // Double-Flux Chain: High Quality (HF) -> Reliable (HF) -> Fail-Safe (Pollinations)
+      const fallbackModels = [
+        "black-forest-labs/FLUX.1-schnell", // Tested & Working for you
+        "runwayml/stable-diffusion-v1-5", 
+        "stabilityai/stable-diffusion-xl-base-1.0"
+      ];
+      
+      let currentModel = fallbackModels[0]; 
+      let fallbackIdx = 1;
+      let usedPollinations = false;
+
+      while (retries > 0) {
+        try {
+          if (usedPollinations) {
+            // Last resort: Pollinations AI (EXPLICITLY FORCING FLUX MODEL TO AVOID 502 ERRORS)
+            const seed = Math.floor(Math.random() * 1000000);
+            const encodedPrompt = encodeURIComponent(prompt);
+            const url = `https://image.pollinations.ai/prompt/${encodedPrompt}?nologo=true&seed=${seed}&model=flux`;
+            hfResponse = await fetch(url);
+          } else {
+            // Hugging Face Chain
+            hfResponse = await fetch(`https://router.huggingface.co/hf-inference/models/${currentModel}`, {
+              headers: {
+                "Authorization": `Bearer ${HUGGINGFACE_API_KEY}`,
+                "Content-Type": "application/json",
+              },
+              method: "POST",
+              body: JSON.stringify({ inputs: prompt }),
+            });
+          }
+
+          if (!hfResponse.ok || hfResponse.status === 503) {
+            console.log(`Image Engine: ${usedPollinations ? 'Pollinations' : currentModel} failed (${hfResponse.status}). Trying next...`);
+            
+            if (fallbackIdx < fallbackModels.length) {
+              currentModel = fallbackModels[fallbackIdx];
+              fallbackIdx++;
+            } else if (!usedPollinations) {
+              usedPollinations = true;
+            } else {
+              break;
+            }
+            
+            retries--;
+            await new Promise(r => setTimeout(r, 1000));
+            continue;
+          }
+          break;
+        } catch (err) {
+          retries--;
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+
+      if (!hfResponse || !hfResponse.ok) {
+        const errText = hfResponse ? await hfResponse.text() : "All generation engines are currently overloaded.";
+        throw new Error(`Integrated Image Engine Error: ${errText}`);
+      }
+
+      const arrayBuffer = await hfResponse.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      const base64 = buffer.toString('base64');
+      resultText = `data:image/jpeg;base64,${base64}`;
+
+
+
+    // ═══════════════════════════════════════════
+    // GROQ (Chat Completions)
+    // ═══════════════════════════════════════════
+    } else if (config.provider === "Groq") {
+      if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY is missing in backend.");
+      
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Groq API Error: ${errText}`);
+      }
+      
+      const data = await res.json();
+      resultText = data.choices[0].message.content;
+
+    // ═══════════════════════════════════════════
+    // GEMINI GROUNDED (Google Search + Gemini)
+    // ═══════════════════════════════════════════
+    } else if (config.provider === "GeminiGrounded") {
+      if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is missing in backend.");
+
+      const combinedPrompt = `${systemPrompt}\n\nUser Request: ${prompt}`;
+      let geminiRes: Response | null = null;
+      let retries = 3;
+      let delay = 1000;
+
+      while (retries > 0) {
+        geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${GEMINI_API_KEY}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: combinedPrompt }] }],
+            tools: [{ googleSearch: {} }]
+          })
+        });
+
+        if (geminiRes.status === 429 || geminiRes.status === 503) {
+          console.log(`Gemini High Demand (${geminiRes.status}). Retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          retries--;
+          delay *= 2; // Exponential backoff
+          continue;
+        }
+        break;
+      }
+
+      if (!geminiRes || !geminiRes.ok) {
+        const errText = geminiRes ? await geminiRes.text() : "Connection failed";
+        if (geminiRes?.status === 429 || geminiRes?.status === 503) {
+          throw new Error("Gemini is currently facing extremely high demand. Please try again in a few seconds.");
+        }
+        throw new Error(`Gemini Grounded Error: ${errText}`);
+      }
+      
+      const data = await geminiRes.json();
+      resultText = data.candidates[0].content.parts
+        .filter((p: any) => p.text)
+        .map((p: any) => p.text)
+        .join("");
+
+    // ═══════════════════════════════════════════
+    // COHERE (Command R+ with Web Search)
+    // ═══════════════════════════════════════════
+    } else if (config.provider === "Cohere") {
+      if (!COHERE_API_KEY) throw new Error("COHERE_API_KEY is missing. Get a free key at https://dashboard.cohere.com");
+
+      const res = await fetch("https://api.cohere.com/v2/chat", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${COHERE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Cohere API Error: ${errText}`);
+      }
+
+      const data = await res.json();
+      resultText = data.message.content[0].text;
+
+    // ═══════════════════════════════════════════
+    // GROQ WHISPER (Speech-to-Text)
+    // ═══════════════════════════════════════════
+    } else if (config.provider === "GroqWhisper") {
+      if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY is missing in backend.");
+      if (!audioFile) throw new Error("No audio file provided for transcription.");
+
+      const formData = new FormData();
+      formData.append("file", audioFile);
+      formData.append("model", config.model);
+      formData.append("response_format", "text");
+
+      const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${GROQ_API_KEY}`,
+        },
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Groq Whisper Error: ${errText}`);
+      }
+
+      resultText = await res.text();
+
+    // ═══════════════════════════════════════════
+    // DEEPGRAM AURA (Text-to-Speech)
+    // ═══════════════════════════════════════════
+    } else if (config.provider === "DeepgramTTS") {
+      if (!DEEPGRAM_API_KEY) throw new Error("DEEPGRAM_API_KEY is missing.");
+      isAudio = true;
+
+      const res = await fetch(`https://api.deepgram.com/v1/speak?model=${config.model}&encoding=mp3`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Token ${DEEPGRAM_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text: prompt }),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Deepgram TTS Error: ${errText}`);
+      }
+
+      const arrayBuffer = await res.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      const base64 = buffer.toString('base64');
+      resultText = `data:audio/mpeg;base64,${base64}`;
+    }
+
+    // ── BACKGROUND LOGGING TO SUPABASE (FAIL-SAFE) ──
+    try {
+      await supabase.from("user_prompts_history").insert({
+        tool_id: toolId,
+        prompt: isAudio ? prompt : (audioFile ? "[Audio Upload]" : prompt),
+        response: isImage ? "[Image Output Buffer]" : isAudio ? "[Audio Output Buffer]" : resultText
+      });
+    } catch (logError) {
+      console.warn("History Logging Warning (Non-Blocker): ", logError);
+      // We don't throw here so the user isn't blocked by a logging failure
+    }
+
+    return NextResponse.json({ success: true, response: resultText, isImage, isAudio });
+
+  } catch (error: any) {
+    console.error("MiAi Switchboard Error: ", error);
+    return NextResponse.json({ error: error.message || "Failed to generate. Network request failed." }, { status: 500 });
+  }
+}
