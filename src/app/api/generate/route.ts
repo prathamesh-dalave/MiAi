@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { supabase } from "@/lib/supabase";
+import { supabase as browserSupabase } from "@/lib/supabase";
+import { createServerSupabase } from "@/lib/supabase-server";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -316,10 +317,15 @@ export async function POST(req: Request) {
 
     // ── BACKGROUND LOGGING TO SUPABASE (FAIL-SAFE) ──
     try {
-      await supabase.from("user_prompts_history").insert({
+      // Check for user session server-side
+      const serverSupabase = await createServerSupabase();
+      const { data: { user } } = await serverSupabase.auth.getUser();
+
+      await serverSupabase.from("user_prompts_history").insert({
         tool_id: toolId,
         prompt: isAudio ? prompt : (audioFile ? "[Audio Upload]" : prompt),
-        response: isImage ? "[Image Output Buffer]" : isAudio ? "[Audio Output Buffer]" : resultText
+        response: isImage ? "[Image Output Buffer]" : isAudio ? "[Audio Output Buffer]" : resultText,
+        user_id: user?.id || null // Automatically links to user if logged in, otherwise stays null for guests
       });
     } catch (logError) {
       console.warn("History Logging Warning (Non-Blocker): ", logError);
