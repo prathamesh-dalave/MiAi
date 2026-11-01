@@ -7,6 +7,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const COHERE_API_KEY = process.env.COHERE_API_KEY;
+const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY;
 
 // Tool Provider Mapping Decoder
 type ProviderType = "Groq" | "GeminiGrounded" | "Cohere" | "HuggingFace" | "GroqWhisper" | "DeepgramTTS" | "Pollinations";
@@ -33,8 +34,8 @@ const TOOL_CONFIG: Record<string, ToolConfig> = {
   // ── Image Generation (100% Free, No credits/keys needed) ──
   "flux": { provider: "Pollinations", model: "flux" },
   "flux-dev": { provider: "Pollinations", model: "flux" },
-  "sdxl": { provider: "Pollinations", model: "turbo" },
-  "sd-core": { provider: "Pollinations", model: "turbo" },
+  "sdxl": { provider: "Pollinations", model: "flux" },
+  "sd-core": { provider: "Pollinations", model: "flux" },
 
   // ── Audio Tools ──
   "whisper-stt": { provider: "GroqWhisper", model: "whisper-large-v3" },
@@ -98,17 +99,26 @@ export async function POST(req: Request) {
       
       const seed = Math.floor(Math.random() * 2147483647);
       const encodedPrompt = encodeURIComponent(prompt.trim());
-      const selectedModel = config.model || (toolId.includes("sd") ? "turbo" : "flux");
-      
+      const selectedModel = config.model || "flux";
+
+      // Headers support optional free API key from enter.pollinations.ai to eliminate watermarks
+      const fetchHeaders: Record<string, string> = {
+        "Accept": "image/*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiAi/1.0",
+      };
+      if (POLLINATIONS_API_KEY) {
+        fetchHeaders["Authorization"] = `Bearer ${POLLINATIONS_API_KEY}`;
+      }
+
       // Multi-layer resilient endpoint strategy for Pollinations AI:
-      // 1. Primary: Requested FLUX or Turbo model
-      // 2. High-speed backup: Turbo model
-      // 3. Alternative backend: gen.pollinations.ai
-      // 4. Default: image.pollinations.ai base
+      // 1. Primary: FLUX model with explicit nologo flag and dimensions
+      // 2. Alternative backend: gen.pollinations.ai endpoint
+      // 3. Resilient fallback: Base endpoint with nologo
+      // 4. Safe fallback: Compact parameter URL
       const candidateUrls = [
         `https://image.pollinations.ai/prompt/${encodedPrompt}?model=${selectedModel}&seed=${seed}&nologo=true&width=1024&height=1024`,
-        `https://image.pollinations.ai/prompt/${encodedPrompt}?model=turbo&seed=${seed}&nologo=true&width=1024&height=1024`,
         `https://gen.pollinations.ai/image/${encodedPrompt}?model=${selectedModel}&seed=${seed}&nologo=true`,
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?seed=${seed}&nologo=true&width=1024&height=1024`,
         `https://image.pollinations.ai/prompt/${encodedPrompt}?seed=${seed}&nologo=true`,
       ];
 
@@ -119,10 +129,7 @@ export async function POST(req: Request) {
 
           const res = await fetch(url, {
             signal: controller.signal,
-            headers: {
-              "Accept": "image/*",
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiAi/1.0",
-            },
+            headers: fetchHeaders,
           });
           clearTimeout(timeoutId);
 
