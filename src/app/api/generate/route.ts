@@ -9,7 +9,7 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const COHERE_API_KEY = process.env.COHERE_API_KEY;
 
 // Tool Provider Mapping Decoder
-type ProviderType = "Groq" | "GeminiGrounded" | "Cohere" | "HuggingFace" | "GroqWhisper" | "DeepgramTTS";
+type ProviderType = "Groq" | "GeminiGrounded" | "Cohere" | "HuggingFace" | "GroqWhisper" | "DeepgramTTS" | "Pollinations";
 
 interface ToolConfig {
   provider: ProviderType;
@@ -30,9 +30,11 @@ const TOOL_CONFIG: Record<string, ToolConfig> = {
   "starcoder": { provider: "Groq", model: "qwen/qwen3-32b" },
   "qwen-coder": { provider: "Groq", model: "qwen/qwen3-32b" }, 
 
-  // ── Image Generation ──
-  "flux": { provider: "HuggingFace", model: "black-forest-labs/FLUX.1-schnell" },
-  "sdxl": { provider: "HuggingFace", model: "stabilityai/sdxl-turbo" },
+  // ── Image Generation (100% Free, No credits/keys needed) ──
+  "flux": { provider: "Pollinations", model: "flux" },
+  "flux-dev": { provider: "Pollinations", model: "flux" },
+  "sdxl": { provider: "Pollinations", model: "turbo" },
+  "sd-core": { provider: "Pollinations", model: "turbo" },
 
   // ── Audio Tools ──
   "whisper-stt": { provider: "GroqWhisper", model: "whisper-large-v3" },
@@ -65,7 +67,10 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
     }
 
-    const config = TOOL_CONFIG[toolId];
+    let config = TOOL_CONFIG[toolId];
+    if (!config && category === "image-generation") {
+      config = { provider: "Pollinations", model: toolId.includes("sd") ? "turbo" : "flux" };
+    }
     if (!config) {
       return NextResponse.json({ error: "Invalid tool configuration or deprecated tool" }, { status: 400 });
     }
@@ -84,77 +89,84 @@ export async function POST(req: Request) {
     }
 
     // ═══════════════════════════════════════════
-    // HUGGING FACE (Image Generation)
+    // IMAGE GENERATION (Pollinations AI — 100% Free & Unlimited)
     // ═══════════════════════════════════════════
-    if (config.provider === "HuggingFace") {
-      if (!HUGGINGFACE_API_KEY) throw new Error("HUGGINGFACE_API_KEY is missing in backend.");
+    if (config.provider === "Pollinations" || config.provider === "HuggingFace" || category === "image-generation") {
       isImage = true;
-      let hfResponse: Response | null = null;
-      let retries = 4;
+      let imgResponse: Response | null = null;
+      let usedMimeType = "image/jpeg";
       
-      // Double-Flux Chain: High Quality (HF) -> Reliable (HF) -> Fail-Safe (Pollinations)
-      const fallbackModels = [
-        "black-forest-labs/FLUX.1-schnell", // Tested & Working for you
-        "runwayml/stable-diffusion-v1-5", 
-        "stabilityai/stable-diffusion-xl-base-1.0"
+      const seed = Math.floor(Math.random() * 2147483647);
+      const encodedPrompt = encodeURIComponent(prompt.trim());
+      const selectedModel = config.model || (toolId.includes("sd") ? "turbo" : "flux");
+      
+      // Multi-layer resilient endpoint strategy for Pollinations AI:
+      // 1. Primary: Requested FLUX or Turbo model
+      // 2. High-speed backup: Turbo model
+      // 3. Alternative backend: gen.pollinations.ai
+      // 4. Default: image.pollinations.ai base
+      const candidateUrls = [
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?model=${selectedModel}&seed=${seed}&nologo=true&width=1024&height=1024`,
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?model=turbo&seed=${seed}&nologo=true&width=1024&height=1024`,
+        `https://gen.pollinations.ai/image/${encodedPrompt}?model=${selectedModel}&seed=${seed}&nologo=true`,
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?seed=${seed}&nologo=true`,
       ];
-      
-      let currentModel = fallbackModels[0]; 
-      let fallbackIdx = 1;
-      let usedPollinations = false;
 
-      while (retries > 0) {
+      for (const url of candidateUrls) {
         try {
-          if (usedPollinations) {
-            // Last resort: Pollinations AI (EXPLICITLY FORCING FLUX MODEL TO AVOID 502 ERRORS)
-            const seed = Math.floor(Math.random() * 1000000);
-            const encodedPrompt = encodeURIComponent(prompt);
-            const url = `https://image.pollinations.ai/prompt/${encodedPrompt}?nologo=true&seed=${seed}&model=flux`;
-            hfResponse = await fetch(url);
-          } else {
-            // Hugging Face Chain
-            hfResponse = await fetch(`https://router.huggingface.co/hf-inference/models/${currentModel}`, {
-              headers: {
-                "Authorization": `Bearer ${HUGGINGFACE_API_KEY}`,
-                "Content-Type": "application/json",
-              },
-              method: "POST",
-              body: JSON.stringify({ inputs: prompt }),
-            });
-          }
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 12000);
 
-          if (!hfResponse.ok || hfResponse.status === 503) {
-            console.log(`Image Engine: ${usedPollinations ? 'Pollinations' : currentModel} failed (${hfResponse.status}). Trying next...`);
-            
-            if (fallbackIdx < fallbackModels.length) {
-              currentModel = fallbackModels[fallbackIdx];
-              fallbackIdx++;
-            } else if (!usedPollinations) {
-              usedPollinations = true;
-            } else {
+          const res = await fetch(url, {
+            signal: controller.signal,
+            headers: {
+              "Accept": "image/*",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiAi/1.0",
+            },
+          });
+          clearTimeout(timeoutId);
+
+          if (res.ok) {
+            const cType = res.headers.get("content-type") || "";
+            if (cType.includes("image") || cType.includes("octet-stream") || !cType.includes("html")) {
+              imgResponse = res;
+              usedMimeType = cType.includes("image") ? cType : "image/jpeg";
               break;
             }
-            
-            retries--;
-            await new Promise(r => setTimeout(r, 1000));
-            continue;
           }
-          break;
-        } catch (err) {
-          retries--;
-          await new Promise(r => setTimeout(r, 1000));
+        } catch (fetchErr) {
+          console.warn(`Pollinations fetch attempt failed for ${url}:`, fetchErr);
         }
       }
 
-      if (!hfResponse || !hfResponse.ok) {
-        const errText = hfResponse ? await hfResponse.text() : "All generation engines are currently overloaded.";
-        throw new Error(`Integrated Image Engine Error: ${errText}`);
+      // Hugging Face fallback if available and Pollinations was unreachable
+      if (!imgResponse && HUGGINGFACE_API_KEY) {
+        try {
+          const hfRes = await fetch("https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell", {
+            headers: {
+              "Authorization": `Bearer ${HUGGINGFACE_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            method: "POST",
+            body: JSON.stringify({ inputs: prompt }),
+          });
+          if (hfRes.ok) {
+            imgResponse = hfRes;
+            usedMimeType = "image/jpeg";
+          }
+        } catch (hfErr) {
+          console.warn("HuggingFace fallback failed:", hfErr);
+        }
       }
 
-      const arrayBuffer = await hfResponse.arrayBuffer();
+      if (!imgResponse || !imgResponse.ok) {
+        throw new Error("Image generation services are temporarily busy. Please try again in a few moments.");
+      }
+
+      const arrayBuffer = await imgResponse.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
-      const base64 = buffer.toString('base64');
-      resultText = `data:image/jpeg;base64,${base64}`;
+      const base64 = buffer.toString("base64");
+      resultText = `data:${usedMimeType};base64,${base64}`;
 
 
 

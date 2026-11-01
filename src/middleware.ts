@@ -31,6 +31,21 @@ export async function middleware(request: NextRequest) {
     }
   )
 
+  // If there's an auth code in the URL, exchange it for a session directly here
+  const code = request.nextUrl.searchParams.get('code')
+  if (code) {
+    await supabase.auth.exchangeCodeForSession(code)
+    // Remove the code from the URL and redirect to clean home page
+    const cleanUrl = new URL('/', request.url)
+    // Build a redirect response that carries our session cookies
+    const redirectResponse = NextResponse.redirect(cleanUrl)
+    // Copy all cookies from the supabase response to the redirect
+    response.cookies.getAll().forEach((cookie) => {
+      redirectResponse.cookies.set(cookie.name, cookie.value)
+    })
+    return redirectResponse
+  }
+
   // This will refresh the session if it's expired
   await supabase.auth.getUser()
 
